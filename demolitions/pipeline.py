@@ -16,7 +16,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .areas import municipality_labels, normalize, resolve_area
-from .diavgeia import KIND_KATEDAFISI, issue_date, permit_kind, search_permits
+from .diavgeia import (GREECE_TZ, KIND_KATEDAFISI, issue_date, permit_kind,
+                       search_permits)
 from .geocode import Geocoder, row_out_of_region
 from .greek import pretty_area
 from .output import write_xlsx
@@ -112,6 +113,11 @@ def run_pipeline(area, from_date, to_date, out_dir, *, cache_dir,
         log(f"Προσοχή: το e-Άδειες ξεκίνησε τον 10/2018· πριν από "
             f"{E_ADEIES_START:%d/%m/%Y} δεν υπάρχουν ομοιόμορφα δεδομένα.")
         from_date = E_ADEIES_START
+    # μελλοντικό «έως» = χιλιάδες άσκοπα (και μη cacheable) αιτήματα στη
+    # Διαύγεια, ή OverflowError κοντά στο date.max
+    today = datetime.now(GREECE_TZ).date()
+    if to_date > today:
+        to_date = today
 
     area_label, munis = resolve_area(area, cache_dir)
     muni_labels = municipality_labels(munis, cache_dir)

@@ -10,7 +10,7 @@ import os
 import tempfile
 import unittest
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 CACHE = str(Path(__file__).parent / "cache")
@@ -87,6 +87,13 @@ class TestResolveArea(unittest.TestCase):
             self.assertIn("Διφορούμενη", msg, q)
             for cand in expected:               # απαριθμεί τους υποψηφίους
                 self.assertIn(cand, msg, q)
+
+    def test_ambiguous_municipality_suggests_qualified_names(self):
+        with self.assertRaises(AreaError) as cm:
+            resolve_area("Ηρακλείου", CACHE)
+        msg = str(cm.exception)
+        self.assertIn("Δήμος Ηρακλείου (Κρήτης)", msg)
+        self.assertIn("Δήμος Ηρακλείου (Αττικής)", msg)
 
     def test_monosimanto_suffix_perifereias_epiluetai(self):
         # μονοσήμαντη κατάληξη εξακολουθεί να δουλεύει (καμία παλινδρόμηση)
@@ -541,6 +548,19 @@ class TestGeocodeHelpers(unittest.TestCase):
             self.assertEqual(get.call_count, 1)
             self.assertEqual(g.cache["Άγνωστο μέρος, Ελλάδα"]["status"], "miss")
 
+    def test_non_json_200_is_transient_not_crash(self):
+        # 200 με σελίδα σφάλματος: ούτε exception, ούτε cached «miss»
+        from unittest import mock
+        from demolitions import geocode
+        fake = mock.Mock(ok=True)
+        fake.json.side_effect = ValueError("not json")
+        with tempfile.TemporaryDirectory() as tmp:
+            g = geocode.Geocoder(tmp)
+            with mock.patch.object(geocode.session, "get", return_value=fake), \
+                 mock.patch.object(geocode.time, "sleep"):
+                self.assertIsNone(g._query("Δράμα, Ελλάδα"))
+            self.assertEqual(g.cache, {})
+
 
 class TestOutput(unittest.TestCase):
     def test_xlsx(self):
@@ -661,6 +681,20 @@ class TestRunsConsistency(unittest.TestCase):
 
 
 class TestRunPipelinePdfCallback(unittest.TestCase):
+    def test_future_to_date_is_clamped_to_today(self):
+        from unittest import mock
+        from datetime import date
+        from demolitions import pipeline
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(pipeline, "search_permits",
+                               return_value=[]) as search:
+            with self.assertRaises(pipeline.NoPermitsFound):
+                pipeline.run_pipeline("Δήμος Δράμας", date(2021, 1, 1),
+                                      date(9998, 12, 31), Path(tmp) / "r",
+                                      cache_dir=CACHE, log=lambda m: None)
+            to_arg = search.call_args[0][1]
+            self.assertLessEqual(to_arg, date.today() + timedelta(days=1))
+
     """Ο pdf_callback ανεβάζει/σβήνει κάθε PDF αμέσως — έτσι ο εφήμερος
     δίσκος δεν γεμίζει σε μεγάλες αναζητήσεις (το bug της Αττικής 2025)."""
 
@@ -1151,6 +1185,31 @@ class TestR2Storage(unittest.TestCase):
 
             # cleanup αφαιρεί partial R2 uploads όταν run.json λείπει
             self.assertEqual(len(list(store.iter_pdfs("r1"))), 0)
+
+    def test_cleanup_keeps_run_on_transient_exists_error(self):
+        # παροδικό σφάλμα του head_object (π.χ. 503/timeout) ΔΕΝ σημαίνει «δεν
+        # υπάρχει»: το cleanup δεν πρέπει να σβήσει ολοκληρωμένο run
+        from unittest import mock
+        from botocore.exceptions import ClientError
+        from moto import mock_aws
+        with mock_aws():
+            import boto3
+            boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="demo-test-bucket")
+            from demolitions.storage import R2Storage
+            store = R2Storage("demo-test-bucket", "acc", "k", "s",
+                              endpoint_url="https://s3.amazonaws.com")
+            d = store.staging_dir("r1")
+            (d / "rows.json").write_text("[]", "utf-8")
+            (d / "run.json").write_text('{"run_id": "r1"}', "utf-8")
+            store.save_run("r1")
+            err = ClientError({"Error": {"Code": "503", "Message": "Slow Down"}},
+                              "HeadObject")
+            with mock.patch.object(store.s3, "head_object", side_effect=err):
+                with self.assertRaises(ClientError):
+                    store.exists("r1")
+                store.cleanup("r1")
+            self.assertTrue(store.exists("r1"))
+            self.assertFalse(store.exists("nope"))     # πραγματικό 404 -> False
 
     def test_delete_orphans_sweeps_uploads_without_manifest(self):
         from moto import mock_aws
@@ -1673,6 +1732,24 @@ class TestFilteredDownload(unittest.TestCase):
         wb = load_workbook(io.BytesIO(zf.read(xlsx[0])))
         self.assertEqual(wb["Κατεδαφίσεις"].max_row, 3)   # header + Α + Γ
 
+    def test_zip_post_without_ada_is_400_not_full_zip(self):
+        # POST = πάντα φιλτραρισμένο· κενό φίλτρο ΔΕΝ πέφτει σε «όλα»
+        for kw in ({"data": {}}, {"json": {"ada": []}}, {"data": {"ada": ["ΑΓΝΩΣΤΟ"]}}):
+            r = self.client.post(self._q("/zip/<rid>.zip"), **kw)
+            self.assertEqual(r.status_code, 400, kw)
+
+    def test_zip_post_accepts_over_1000_urlencoded_ada(self):
+        # το front-end στέλνει x-www-form-urlencoded (όχι multipart, που το
+        # Werkzeug κόβει στα 1000 πεδία με 413)
+        from urllib.parse import urlencode
+        ada = ["ΑΔΑ-Α"] + [f"ΧΧ{i}" for i in range(1500)]
+        r = self.client.post(self._q("/zip/<rid>.zip"),
+                             data=urlencode([("ada", a) for a in ada]),
+                             content_type="application/x-www-form-urlencoded")
+        self.assertEqual(r.status_code, 200)
+        names = zipfile.ZipFile(io.BytesIO(r.data)).namelist()
+        self.assertIn("pdf/Δήμος Α/2021/ΑΔΑ-Α.pdf", names)
+
     def test_zip_without_filter_unchanged(self):
         # χωρίς ?ada= → πλήρες zip (xlsx + όλα τα PDF), αμετάβλητο
         r = self.client.get(self._q("/zip/<rid>.zip"))
@@ -2022,14 +2099,20 @@ class TestWebUI(unittest.TestCase):
 
     def test_filtered_download_guard_on_zero_match(self):
         """Φίλτρο με 0 αποτελέσματα δεν πρέπει να κατεβάζει ΟΛΟ το run ως
-        «φιλτραρισμένο»: το κουμπί κρύβεται και ο handler κόβει το κενό ada
-        (server-side το κενό φίλτρο σημαίνει «χωρίς φίλτρο» -> πλήρες zip)."""
+        «φιλτραρισμένο»: το κουμπί κρύβεται, ο handler κόβει το κενό ada, και
+        (άμυνα σε βάθος) ο server απαντά 400 σε POST χωρίς ΑΔΑ."""
         html = self.client.get("/").get_data(as_text=True)
         # ορατότητα: κρυφό όταν δεν φιλτράρεται κάτι Ή δεν μένει καμία γραμμή
         self.assertIn('"hidden", !active || !view.length', html)
         # φράχτης στον handler: ρητά κενό υποσύνολο -> μήνυμα, όχι POST
         self.assertIn("f.ada.length === 0", html)
         self.assertIn("Κανένα αποτέλεσμα με τα τρέχοντα φίλτρα.", html)
+        # ποτέ fallback σε κενή λίστα ΑΔΑ (= «όλα» παλιότερα)
+        self.assertNotIn("ada || []", html)
+        self.assertNotIn("adaForm([])", html)
+        # urlencoded σώμα, όχι multipart FormData (413 πάνω από 1000 πεδία)
+        self.assertIn("new URLSearchParams", html)
+        self.assertNotIn("new FormData", html)
 
 
 if __name__ == "__main__":

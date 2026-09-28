@@ -143,7 +143,15 @@ class Geocoder:
                 continue
             time.sleep(1.1)
             if r.ok:
-                hits = r.json()
+                try:
+                    hits = r.json()
+                except ValueError:
+                    # 200 με σελίδα σφάλματος (όχι JSON): παροδικό — ούτε cache
+                    # «miss», ούτε να ρίξει όλη τη γεωκωδικοποίηση
+                    if attempt == 3:
+                        return None
+                    time.sleep(2 ** attempt)
+                    continue
                 if hits:
                     lat, lon = float(hits[0]["lat"]), float(hits[0]["lon"])
                     if LAT_RANGE[0] <= lat <= LAT_RANGE[1] and \

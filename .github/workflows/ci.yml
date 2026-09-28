@@ -30,8 +30,12 @@ jobs:
           import re
           html = open("templates/index.html", encoding="utf-8").read()
           open("/tmp/ui.js", "w").write(re.findall(r"<script>(.*?)</script>", html, re.S)[-1])
+          # και το client-zip module (<script type="module">) — αλλιώς δεν ελεγχόταν ποτέ
+          open("/tmp/ui-module.mjs", "w").write(
+              re.findall(r'<script type="module">(.*?)</script>', html, re.S)[-1])
           PY
           node --check /tmp/ui.js
+          node --check /tmp/ui-module.mjs
 
   deploy:
     needs: test

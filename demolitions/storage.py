@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 
@@ -286,7 +287,9 @@ class R2Storage:
     def cleanup(self, run_id):
         shutil.rmtree(self._staging / run_id, ignore_errors=True)
         # αν το run απέτυχε πριν το save_run, καθαρίζει partial uploads στο R2
-        # (προστασία από orphaned PDF objects όταν διακόπτεται η αναζήτηση)
+        # (προστασία από orphaned PDF objects όταν διακόπτεται η αναζήτηση)·
+        # αν το exists() αποτύχει παροδικά, ΔΕΝ σβήνουμε τίποτα — τυχόν orphan
+        # τα μαζεύει αργότερα το delete_orphans
         try:
             if not self.exists(run_id):
                 self.delete_run(run_id)
@@ -319,12 +322,19 @@ class R2Storage:
         return True
 
     def exists(self, run_id):
+        """True/False μόνο όταν το R2 απαντά οριστικά. Παροδικά σφάλματα
+        (timeout, throttling, DNS) ΑΝΑΔΙΔΟΝΤΑΙ: ένα ψευδές False εδώ έκανε το
+        cleanup() να σβήνει ολόκληρο ένα ολοκληρωμένο run."""
+        from botocore.exceptions import ClientError
         try:
             self.s3.head_object(Bucket=self.bucket,
                                 Key=self._key(run_id, "run.json"))
             return True
-        except Exception:
-            return False
+        except ClientError as e:
+            code = str(e.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
 
     def read_manifest(self, run_id):
         obj = self.s3.get_object(Bucket=self.bucket,
@@ -390,17 +400,28 @@ class R2Storage:
             yield b
 
     def list_runs(self):
-        out = []
+        found = []
         paginator = self.s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix="runs/"):
             for o in page.get("Contents", []):
-                if o["Key"].endswith("/run.json"):
-                    try:   # ένα run που σβήνεται ταυτόχρονα δεν ρίχνει όλη τη λίστα
-                        m = self.read_manifest(o["Key"].split("/")[1])
-                    except Exception:
-                        continue
-                    m["_mtime"] = o["LastModified"].timestamp()
-                    out.append(m)
+                parts = o["Key"].split("/")
+                if len(parts) == 3 and parts[2] == "run.json":
+                    found.append((parts[1], o["LastModified"].timestamp()))
+
+        def load(item):
+            run_id, mtime = item
+            try:   # ένα run που σβήνεται ταυτόχρονα δεν ρίχνει όλη τη λίστα
+                m = self.read_manifest(run_id)
+            except Exception:
+                return None
+            m["_mtime"] = mtime
+            return m
+
+        # ένα GET ανά run.json — παράλληλα, αλλιώς το ιστορικό με ~100 run
+        # χρειαζόταν δευτερόλεπτα σειριακών round-trips (το boto3 client είναι
+        # thread-safe)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            out = [m for m in pool.map(load, found) if m is not None]
         out.sort(key=_manifest_sort_key, reverse=True)
         return out
 

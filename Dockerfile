@@ -12,8 +12,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# χωρίς root: ο κώδικας μένει read-only (ανήκει στον root)· γράφεται μόνο το /tmp
+RUN useradd --system --create-home app
+USER app
+
 # cache (λεξικό/geocode) σε εφήμερο /tmp· τα run μένουν στο R2 (βλ. env)
 ENV DEMOLITIONS_CACHE_DIR=/tmp/demolitions-cache
+# (και τα run, αν τρέξει χωρίς R2 — το /app δεν είναι εγγράψιμο για τον app)
+ENV DEMOLITIONS_RUNS_DIR=/tmp/demolitions-runs
 
 # περιορίζει τα glibc malloc arenas ώστε να μη διογκώνεται το RSS από
 # κατακερματισμό όταν πολλά threads κάνουν alloc/free των MB-μεγέθους PDF

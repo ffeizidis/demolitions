@@ -179,8 +179,12 @@ def resolve_area(area, cache_dir):
             labels.append(munis[muni_hits[0]])
             continue
         if len(muni_hits) > 1:
+            # δείξε τις μορφές που γίνονται δεκτές («Δήμος Ηρακλείου (Κρήτης)»)
+            # — σκέτο «ΔΗΜΟΣ ΗΡΑΚΛΕΙΟΥ, ΔΗΜΟΣ ΗΡΑΚΛΕΙΟΥ» δεν βοηθά τον χρήστη
+            shown = municipality_labels(muni_hits, cache_dir)
             raise AreaError(f"Διφορούμενη περιοχή «{part.strip()}»: "
-                            + ", ".join(munis[u] for u in muni_hits))
+                            + ", ".join(f"«{shown[u]['display']}»"
+                                        for u in muni_hits))
 
         # Νομός / περιφερειακή ενότητα
         bare = token

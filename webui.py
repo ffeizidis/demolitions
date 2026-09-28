@@ -28,7 +28,7 @@ from flask import Flask, Response, abort, jsonify, render_template, request
 from zipstream import ZipStream
 
 from demolitions.areas import AreaError, list_areas, normalize, resolve_area
-from demolitions.diavgeia import session as diavgeia_session
+from demolitions.diavgeia import GREECE_TZ, session as diavgeia_session
 from demolitions.greek import pretty_area
 from demolitions.output import write_xlsx
 from demolitions.pipeline import (CancelledRun, E_ADEIES_START, NoPermitsFound,
@@ -317,12 +317,17 @@ def api_areas():
 
 @app.post("/api/run")
 def api_run():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Μη έγκυρο αίτημα."}), 400
     try:
-        from_date = date.fromisoformat(data.get("from", ""))
-        to_date = date.fromisoformat(data.get("to", ""))
-    except ValueError:
+        from_date = date.fromisoformat(data.get("from") or "")
+        to_date = date.fromisoformat(data.get("to") or "")
+    except (TypeError, ValueError):
         return jsonify({"error": "Μη έγκυρη ημερομηνία."}), 400
+    # όχι μελλοντικό «έως» (βλ. run_pipeline) — κλειδώνεται κι εδώ ώστε το
+    # run_id/ιστορικό να δείχνουν το πραγματικό διάστημα
+    to_date = min(to_date, datetime.now(GREECE_TZ).date())
     if from_date > to_date:
         return jsonify({"error": "Η αρχή του διαστήματος είναι μετά το τέλος του."}), 400
     area = (data.get("area") or "").strip()
@@ -351,7 +356,7 @@ def api_geocode(run_id):
 
 @app.get("/api/status")
 def api_status():
-    since = request.args.get("since", 0, type=int)
+    since = max(0, request.args.get("since", 0, type=int))
     return jsonify({
         "state": job.state,
         "log": job.log[since:],
@@ -421,8 +426,12 @@ def api_delete_all_pdfs():
         m["has_pdfs"] = False
         store.write_manifest(m["run_id"], m)
         cleared += 1
-    # ελευθέρωσε και τα ημιτελή ανεβάσματα (orphan) που δεν φαίνονται στο ιστορικό
-    orphans = store.delete_orphans(keep_ids=(active,) if active else ())
+    # ελευθέρωσε και τα ημιτελή ανεβάσματα (orphan) που δεν φαίνονται στο ιστορικό.
+    # Υπό το lock και με ΦΡΕΣΚΟ active: ένα run που ξεκίνησε κατά τον βρόχο
+    # παραπάνω έχει ήδη ανεβασμένα PDF αλλά όχι run.json — θα έμοιαζε orphan
+    with lock:
+        active = job.run_id if job.state in ("running", "geocoding") else None
+        orphans = store.delete_orphans(keep_ids=(active,) if active else ())
     return jsonify({"ok": True, "cleared": cleared, "orphans": orphans})
 
 
@@ -527,24 +536,24 @@ def _zip_member(run_id, arc, ada=None):
 
 
 def _ada_filter():
-    """Προαιρετικό φίλτρο ΑΔΑ για το φιλτραρισμένο zip. Διαβάζεται ΜΟΝΟ από το
-    σώμα ενός POST — ένα `ada` form field ανά ΑΔΑ (`request.form.getlist`), ή
-    εναλλακτικά JSON `{"ada":[...]}`. Κάθε ΑΔΑ ταξιδεύει ως ξεχωριστή τιμή, οπότε
-    είναι ασφαλές ανεξαρτήτως περιεχομένου (π.χ. κόμμα) και χωρίς όριο μήκους URL
-    — σε αντίθεση με ένα `?ada=a,b,c` query string, που το comma-split θα έσπαγε
-    και που για ~1500 γραμμές ξεπερνά τα όρια header proxy/CDN (414/400).
-    Επιστρέφει None αν δεν υπάρχει φίλτρο (πλήρες zip — καμία αλλαγή στη
-    συμπεριφορά), αλλιώς set των ΑΔΑ (κενά αγνοούνται)."""
+    """Φίλτρο ΑΔΑ για το φιλτραρισμένο zip. GET = πλήρες zip (None)· POST =
+    ΠΑΝΤΑ φιλτραρισμένο. Η λίστα διαβάζεται από το σώμα — ένα `ada` form field
+    ανά ΑΔΑ (`request.form.getlist`), ή εναλλακτικά JSON `{"ada":[...]}`. Κάθε
+    ΑΔΑ ταξιδεύει ως ξεχωριστή τιμή, οπότε είναι ασφαλές ανεξαρτήτως
+    περιεχομένου (π.χ. κόμμα) και χωρίς όριο μήκους URL — σε αντίθεση με ένα
+    `?ada=a,b,c` query string, που το comma-split θα έσπαγε και που για ~1500
+    γραμμές ξεπερνά τα όρια header proxy/CDN (414/400).
+
+    Ένα POST χωρίς ΑΔΑ δίνει ΚΕΝΟ set (όχι None): αλλιώς ένα κενό φίλτρο θα
+    κατέβαζε ολόκληρο το run ως «φιλτραρισμένο»."""
     if request.method != "POST":
         return None
     ada = request.form.getlist("ada")
     if not ada:
         body = request.get_json(silent=True) or {}
-        raw = body.get("ada")
+        raw = body.get("ada") if isinstance(body, dict) else None
         if isinstance(raw, list):
             ada = [a for a in raw if isinstance(a, str)]
-    if not ada:
-        return None
     return {a for a in ada if a}
 
 
@@ -557,6 +566,8 @@ def serve_zip(run_id):
     ada_set = _ada_filter()
     if ada_set is not None:                         # φιλτραρισμένο zip
         rows = [r for r in rows if r.get("ada") in ada_set]
+        if not rows:
+            return jsonify({"error": "Καμία γραμμή δεν ταιριάζει με τα ΑΔΑ."}), 400
 
     zs = ZipStream()
     xlsx = f"{run_id}.xlsx"

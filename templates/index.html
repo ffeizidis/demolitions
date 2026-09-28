@@ -414,7 +414,7 @@ async function renderResults(container, manifest, geocodingNow) {
     b.className = "minor";
     b.textContent = "Προσθήκη συντεταγμένων";
     b.onclick = async () => {
-      const r = await fetch("/api/geocode/" + manifest.run_id, { method: "POST" });
+      const r = await fetch("/api/geocode/" + encodeURIComponent(manifest.run_id), { method: "POST" });
       if (r.ok) { showTab("search"); cursor = 0; rowsShownFor = null; startPolling(); }
       else { alert((await r.json()).error); }
     };
@@ -985,12 +985,13 @@ async function startZip(runId, zipname) {
 // φιλτραρισμένο υποσύνολο το δημοσιεύει το classic-script redraw() στο
 // window.__demolitionsFilter[runId].
 const FPREFIX = "zipstat-filtered-";
-// FormData με ένα επαναλαμβανόμενο πεδίο "ada" ανά ΑΔΑ — value-safe & χωρίς όριο
-// μήκους URL· το διαβάζει ο server με request.form.getlist("ada").
+// Σώμα x-www-form-urlencoded με ένα επαναλαμβανόμενο πεδίο "ada" ανά ΑΔΑ —
+// value-safe & χωρίς όριο μήκους URL· το διαβάζει ο server με
+// request.form.getlist("ada"). ΟΧΙ FormData: αυτό στέλνει multipart, και το
+// Werkzeug απορρίπτει multipart με >1000 πεδία (413) — δηλαδή κάθε φίλτρο
+// με >1000 γραμμές.
 function adaForm(adaList) {
-  const fd = new FormData();
-  for (const a of adaList) fd.append("ada", a);
-  return fd;
+  return new URLSearchParams(adaList.map(a => ["ada", a]));
 }
 async function startFilteredZip(runId) {
   // ΣΕΙΡΑ ΚΡΙΣΙΜΗ (όπως στο startZip): showSaveFilePicker() ΧΩΡΙΣ προηγούμενο
@@ -1004,11 +1005,17 @@ async function startFilteredZip(runId) {
     setStatus(runId, "Κανένα αποτέλεσμα με τα τρέχοντα φίλτρα.", false, FPREFIX);
     return;
   }
-  const ada = (f && f.ada && f.ada.length) ? f.ada : null;
+  // χωρίς δημοσιευμένο υποσύνολο δεν ξέρουμε τι να κατεβάσουμε — ΔΕΝ πέφτουμε
+  // σε «όλα» (ο server απορρίπτει άλλωστε POST χωρίς ΑΔΑ με 400)
+  if (!f || !f.ada) {
+    setStatus(runId, "Ξαναδοκιμάστε μετά την αλλαγή φίλτρων.", false, FPREFIX);
+    return;
+  }
+  const ada = f.ada;
   if (!window.showSaveFilePicker) {           // μη-Chromium → server filtered zip
     // κρυφό form-POST: η λίστα ΑΔΑ στο σώμα (όχι σε query string)· δεν χρειάζεται
     // save-picker, ούτε επιπλέον user activation πέρα από το click.
-    postFilteredZip(runId, ada || []);
+    postFilteredZip(runId, ada);
     return;
   }
   let handle;
@@ -1019,22 +1026,7 @@ async function startFilteredZip(runId) {
     });
   } catch (err) {
     if (err && err.name === "AbortError") return;   // ο χρήστης ακύρωσε
-    showServerFallback(runId, FPREFIX, ada || []);   // ο picker δεν είναι διαθέσιμος
-    return;
-  }
-  // αν λείπει το δημοσιευμένο υποσύνολο (σπάνιο) → server filtered zip στο handle
-  if (!ada) {
-    try {
-      setStatus(runId, "Δημιουργία zip στον server…", true, FPREFIX);
-      const sr = await fetch("/zip/" + encodeURIComponent(runId) + ".zip",
-        { method: "POST", body: adaForm([]) });
-      if (sr.ok && sr.body) {
-        await sr.body.pipeTo(await handle.createWritable());
-        setStatus(runId, "✓ αποθηκεύτηκε", false, FPREFIX);
-      } else { showServerFallback(runId, FPREFIX, []); }
-    } catch (err) {
-      if (!(err && err.name === "AbortError")) showServerFallback(runId, FPREFIX, []);
-    }
+    showServerFallback(runId, FPREFIX, ada);   // ο picker δεν είναι διαθέσιμος
     return;
   }
   try {
