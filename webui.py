@@ -38,7 +38,7 @@ from demolitions.storage import content_type, make_storage
 BASE = Path(__file__).parent
 CACHE_DIR = Path(os.environ.get("DEMOLITIONS_CACHE_DIR", BASE / "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-GITHUB_URL = "https://github.com/ZenFeedbacker/demolitions"
+GITHUB_URL = "https://github.com/ffeizidis/demolitions"
 START_TIME = time.time()
 RATE_LIMIT_WINDOW_SECONDS = int(
     os.environ.get("DEMOLITIONS_RATE_LIMIT_WINDOW_SECONDS", "60")
